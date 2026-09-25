@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -e
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$DIR")"
+cd "$DIR"
+
+echo "==> 检查 Docker"
+if ! command -v docker >/dev/null 2>&1; then
+  echo "未检测到 Docker。请先安装并打开 Docker Desktop: https://www.docker.com/products/docker-desktop/"
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker 没有在运行，请先打开 Docker Desktop App，等它启动完成后重新运行本脚本。"
+  exit 1
+fi
+
+echo "==> 检查 Docker host networking 支持 (SIP/RTP 需要用到)"
+if ! docker run --rm --network host alpine true >/dev/null 2>&1; then
+  echo "警告: 这台 Docker 似乎不支持 --network host。"
+  echo "请在 Docker Desktop -> Settings -> Resources -> Network 里勾选 'Enable host networking'，然后重启 Docker Desktop 再重试。"
+  exit 1
+fi
+
+echo "==> 停止阶段一里单独运行的 livekit-server (避免和 Docker 里的 7880 端口冲突)"
+[ -f "$ROOT/livekit-server.pid" ] && kill "$(cat "$ROOT/livekit-server.pid")" 2>/dev/null || true
+rm -f "$ROOT/livekit-server.pid"
+
+echo "==> 启动 redis + livekit-server + livekit-sip (docker compose)"
+docker compose up -d
+
+echo "==> 等待 LiveKit server 就绪..."
+for i in $(seq 1 30); do
+  if curl -sS -m 2 http://localhost:7880 >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+echo "==> 检查 / 安装 lk CLI (livekit-cli)"
+if ! command -v lk >/dev/null 2>&1; then
+  brew install livekit-cli
+fi
+
+echo "==> 创建 inbound SIP trunk"
+lk sip inbound create trunk.json --url ws://localhost:7880 --api-key devkey --api-secret secret || echo "(如果提示已存在，忽略即可，说明之前已经创建过)"
+
+echo "==> 创建 dispatch rule (把呼入的电话路由到 phone-call-room 房间)"
+lk sip dispatch create dispatch-rule.json --url ws://localhost:7880 --api-key devkey --api-secret secret || echo "(如果提示已存在，忽略即可)"
+
+echo "==> 安装 Linphone 软电话 (用于本地模拟拨号测试, 可选)"
+brew list --cask linphone &>/dev/null || brew install --cask linphone || echo "Linphone 自动安装失败，你也可以手动从 https://www.linphone.org/en/free-sip-phone/ 下载"
+
+echo "==> 启动 Speaches (本地 TTS: Kokoro, OpenAI 兼容 API, 端口 8000)"
+docker rm -f speaches >/dev/null 2>&1 || true
+docker run \
+  --rm \
+  --detach \
+  --publish 8000:8000 \
+  --name speaches \
+  --volume hf-hub-cache:/home/ubuntu/.cache/huggingface/hub \
+  ghcr.io/speaches-ai/speaches:latest-cpu
+
+echo "==> 等待 Speaches 就绪..."
+for i in $(seq 1 30); do
+  if curl -sS -m 2 http://localhost:8000/health >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+echo "==> 检查/安装 uv (用来下载 Speaches 的 TTS 模型)"
+if ! command -v uvx >/dev/null 2>&1; then
+  brew install uv
+fi
+
+echo "==> 下载 TTS 模型 Kokoro (第一次会比较慢)"
+export SPEACHES_BASE_URL="http://localhost:8000"
+uvx speaches-cli model download speaches-ai/Kokoro-82M-v1.0-ONNX
+
+echo "==> 准备 FunASR (本地 STT, 阿里 SenseVoice 模型, 端口 8001)"
+if [ ! -d "$DIR/funasr-venv" ]; then
+  python3 -m venv "$DIR/funasr-venv"
+fi
+source "$DIR/funasr-venv/bin/activate"
+pip install -q --upgrade pip
+pip install -q torch torchaudio
+pip install -q funasr fastapi uvicorn python-multipart
+
+echo "==> 停止可能已在运行的旧 funasr-server 进程"
+[ -f "$DIR/funasr-server.pid" ] && kill "$(cat "$DIR/funasr-server.pid")" 2>/dev/null || true
+
+echo "==> 启动 funasr-server (后台运行，第一次会自动下载 SenseVoice 模型，比较慢)"
+nohup funasr-server --host 127.0.0.1 --port 8001 --model sensevoice --device cpu \
+  > "$DIR/funasr-server.log" 2>&1 &
+echo $! > "$DIR/funasr-server.pid"
+deactivate
+
+echo "==> 等待 funasr-server 就绪 (含模型下载，可能需要几分钟，请耐心等待)..."
+for i in $(seq 1 180); do
+  if curl -sS -m 2 http://localhost:8001/v1/audio/transcriptions -F "model=sensevoice" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+echo "==> 检查 / 安装 Ollama (本地 LLM)"
+if ! command -v ollama >/dev/null 2>&1; then
+  brew install ollama
+fi
+brew services start ollama >/dev/null 2>&1 || true
+sleep 2
+echo "==> 下载 Ollama 模型 qwen2.5:7b (Qwen2.5, 阿里通义千问, 本地跑)"
+ollama pull qwen2.5:7b
+
+echo "==> 准备 Python 虚拟环境并安装 Agent 依赖"
+cd "$DIR/agent"
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+fi
+source .venv/bin/activate
+pip install -q --upgrade pip
+pip install -q -r requirements.txt
+
+echo "==> 停止可能已在运行的旧 agent 进程"
+[ -f "$DIR/agent.pid" ] && kill "$(cat "$DIR/agent.pid")" 2>/dev/null || true
+
+echo "==> 启动语音 Agent (后台运行)"
+nohup python agent.py dev > "$DIR/agent.log" 2>&1 &
+echo $! > "$DIR/agent.pid"
+deactivate
+sleep 3
+
+echo ""
+echo "================================================================"
+echo " 全部启动完成！"
+echo ""
+echo " 用 Linphone 拨打这个地址来模拟来电:"
+echo "   sip:1000@127.0.0.1:5060"
+echo " (打开 Linphone -> 跳过账号注册 / 直接在拨号栏输入上面地址 -> 呼叫)"
+echo ""
+echo " 电话接通后会路由进房间 phone-call-room，本地语音 Agent 会自动接听"
+echo " (STT: FunASR/SenseVoice, LLM: Ollama qwen2.5:7b, TTS: Speaches/Kokoro)"
+echo ""
+echo " 日志:"
+echo "   docker compose logs -f sip       # SIP 网桥日志"
+echo "   docker compose logs -f livekit   # LiveKit server 日志"
+echo "   tail -f $DIR/funasr-server.log   # FunASR 日志"
+echo "   tail -f $DIR/agent.log           # 语音 Agent 日志"
+echo ""
+echo " 停止全部: bash $DIR/stop.sh"
+echo "================================================================"

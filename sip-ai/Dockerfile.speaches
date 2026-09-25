@@ -1,0 +1,52 @@
+FROM ghcr.io/speaches-ai/speaches:latest-cpu
+
+# ── 修复 1: Kokoro 中文语音的 language 字段 ─────────────────────────────
+# Speaches 的 Kokoro 中文语音 (zf_*/zm_*) 在 VOICES 列表里把 language 硬编码成了 "zh"。
+# 这个字段现在只在 generate_audio() 里用来判断"是不是中文语音、要不要走 misaki 音素
+# 转换"(见修复 3)，不再直接传给 espeak-ng，所以具体字符串是什么不重要，统一改成 "cmn"
+# 方便识别和 grep。
+# grep 断言：如果上游镜像以后改了文件结构导致替换不到任何内容，构建直接失败，
+# 而不是悄悄地什么都没修就构建成功。
+RUN F=/home/ubuntu/speaches/src/speaches/executors/kokoro/utils.py && \
+    grep -q 'language="zh"' "$F" && \
+    sed -i 's/language="zh"/language="cmn"/g' "$F" && \
+    ! grep -q 'language="zh"' "$F"
+
+# ── 修复 2: strip_emojis() 把整个中文都当成表情符号删掉了 ─────────────────
+# text_utils.py 里 strip_emojis() 的正则表达式有一段范围写得过宽:
+#   \U000024c2-\U0001f251
+# 这个区间 (U+24C2 ~ U+1F251) 把 CJK 统一汉字区 (U+4E00-9FFF)、中文标点、日文假名、
+# 韩文谚文全都覆盖进去了，导致任何中文文本经过 strip_emojis() 都会被完全清空成空
+# 字符串 (对应的现象是 Speaches 日志里的 "Generated audio for 0 characters"，以及
+# 返回一个只有 wav 头、没有任何音频数据的 44 字节文件)。这里直接删掉这一行过宽的
+# range (原意大概是想过滤"带圈字符"这类表情，删掉只会让极少数带圈符号表情不被过滤，
+# 不影响正常使用)。
+RUN F=/home/ubuntu/speaches/src/speaches/text_utils.py && \
+    grep -q '000024c2-' "$F" && \
+    sed -i '/000024c2-/d' "$F" && \
+    ! grep -q '000024c2-' "$F"
+
+# ── 修复 3: 用 misaki 替代 espeak-ng 做中文文字转音素 ────────────────────
+# kokoro-onnx 自带的 Tokenizer.phonemize() 是通用实现，中文靠 espeak-ng 处理:
+#   - lang="zh"               这个 espeak-ng 版本直接报错 (不支持)
+#   - lang="cmn"               会产出乱码 (把中文误判成别的语言，混进语言切换标记)
+#   - lang="cmn-latn-pinyin"   能出声，但声调是用数字表示 (如 "ni2 hao2")，Kokoro 的
+#                              音素表里没有数字这个符号，声调信息会被直接过滤掉，
+#                              发音因此非常不自然 (没有声调的中文听起来很怪)
+# misaki 是 Kokoro 官方用的中文 G2P (文字转音素) 库，生成的音素自带声调符号
+# (→↓↗↘ 对应一二三四声)，这些符号正好都在 Kokoro 的音素表里，不会被过滤掉。
+# 这个镜像里的 python 环境是 uv 管理的虚拟环境，本身没装 pip，所以先用 ensurepip
+# 补一个 pip 进去，再装 misaki。装 [zh,en] 两个 extra：中英文混说时，纯英文片段
+# (比如 "APP"、"machine learning") 会单独交给 misaki.en 处理 (见 zh_g2p.py 里的
+# 说明)，misaki[en] 这个 extra 还会顺带装 num2words / en_core_web_sm 这些依赖。
+RUN /home/ubuntu/speaches/.venv/bin/python3 -m ensurepip --upgrade && \
+    /home/ubuntu/speaches/.venv/bin/python3 -m pip install --quiet --no-cache-dir "misaki[zh,en]"
+
+COPY speaches-patches/zh_g2p.py /home/ubuntu/speaches/src/speaches/zh_g2p.py
+
+COPY speaches-patches/patch_kokoro_generate_audio.py /tmp/patch_kokoro_generate_audio.py
+# 注意：这里不删 /tmp 里的补丁脚本文件了——这个镜像的 RUN 步骤是以非 root 用户
+# (运行 speaches 服务的那个用户) 执行的，而 COPY 进来的文件默认是 root 拥有，
+# 非 root 用户删不掉 (rm: Operation not permitted)，构建会直接失败。留着这个几 KB
+# 的脚本文件不影响任何功能，比强行用 sudo/chown 简单。
+RUN /home/ubuntu/speaches/.venv/bin/python3 /tmp/patch_kokoro_generate_audio.py

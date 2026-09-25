@@ -1,0 +1,10 @@
+{
+  "dispatch_rule": {
+    "rule": {
+      "dispatchRuleDirect": {
+        "roomName": "phone-call-room"
+      }
+    },
+    "name": "Local dispatch rule"
+  }
+}

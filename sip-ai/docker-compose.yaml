@@ -1,0 +1,22 @@
+# livekit-sip 不放在这里跑了 —— Docker Desktop 在 macOS 上的 "host networking" 对 UDP
+# 的双向转发不可靠 (容器用收到请求时的源端口回包经常被吞)，导致 SIP 呼叫 "no ACK received"。
+# livekit-sip 改成从源码编译成原生 macOS 二进制直接跑 (见 setup.sh)，redis 和 livekit-server
+# 走的是 TCP/WebSocket，Docker 没有这个问题，继续留在这里。
+services:
+  redis:
+    image: redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+  livekit:
+    image: livekit/livekit-server
+    command: --dev --redis-host localhost:6379
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_started
+
+volumes:
+  redis_data:

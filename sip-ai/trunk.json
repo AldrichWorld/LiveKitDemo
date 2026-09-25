@@ -1,0 +1,11 @@
+{
+  "trunk": {
+    "name": "Local test trunk",
+    "numbers": [],
+    "allowed_addresses": [
+      "127.0.0.1",
+      "192.168.8.217"
+    ],
+    "krisp_enabled": false
+  }
+}

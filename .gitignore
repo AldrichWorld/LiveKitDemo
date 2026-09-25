@@ -1,0 +1,22 @@
+# Third-party clones - not vendored; see README for setup instructions
+sip-ai/livekit-sip-src/
+sip-ai/livekit-sip
+cosyvoice-eval/*
+!cosyvoice-eval/benchmark.py
+!cosyvoice-eval/download_cosyvoice.py
+
+# Node
+meet/node_modules/
+meet/.next/
+
+# Python
+sip-ai/funasr-venv/
+__pycache__/
+*.pyc
+
+# Logs / pids / runtime state
+*.log
+*.pid
+
+# OS
+.DS_Store
