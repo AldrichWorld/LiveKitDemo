@@ -18,3 +18,8 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Local secrets - never commit real API keys
+sip-ai/agent/.env.local
+.env
+.env.local
