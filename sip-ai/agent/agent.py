@@ -5,38 +5,53 @@ from collections.abc import AsyncIterable
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, JobContext, ModelSettings, WorkerOptions, cli
-from livekit.plugins import openai, silero
+from livekit.plugins import aliyun, silero
 
 load_dotenv(".env.local")
 
-logger = logging.getLogger("local-voice-agent")
+logger = logging.getLogger("dashscope-voice-agent")
 
-# 本地 FunASR (STT, OpenAI 兼容 API, funasr-server 起在 8001 端口)
-# Fun-ASR-Nano 比 SenseVoice 新，架构是 SenseVoice 编码器 + Qwen3-0.6B，
-# 专门针对中英文混说 (code-switching) 场景优化过，CPU 上约 3.6x 实时速度。
-FUNASR_URL = "http://localhost:8001/v1"
-STT_MODEL = "fun-asr-nano"
+# 阿里云百炼 (DashScope) —— LLM / STT / TTS 全部走这一个账号的 API Key
+# (DASHSCOPE_API_KEY 环境变量，在 .env.local 里配置，参见 aliyun.LLM/STT/TTS
+# 的实现：三个类都会自动读取这个环境变量，不用在代码里显式传 api_key)。
+#
+# 区域说明：livekit-plugins-aliyun 的 LLM 类把 base_url 硬编码成了
+# https://dashscope.aliyuncs.com/compatible-mode/v1 (国内/北京区域)。
+# STT/TTS 走的是 wss://dashscope.aliyuncs.com/api-ws/v1/inference，同样是国内区域。
+# 国内电话场景直接用国内区域的 API Key 即可；如果你的 Key 是国际站(Singapore)开的，
+# 这里会直接鉴权失败，需要去百炼控制台确认 Key 所在区域。
 
-# 本地 Speaches (TTS, OpenAI 兼容 API, 端口 8000)
-# Kokoro 这个模型是按语言分语音的：一个语音只服务一种语言，中文语音读英文、
-# 英文语音读中文都会发音不准/很怪，甚至会卡很久 (见下面 Assistant.tts_node 的说明)。
-# 所以这里准备两套语音，按"实际要念出来的这句回复文本"动态切换。
-SPEACHES_URL = "http://localhost:8000/v1"
-TTS_MODEL = "speaches-ai/Kokoro-82M-v1.0-ONNX"
-TTS_VOICE_ZH = "zf_xiaoxiao"  # Kokoro 官方内置的普通话女声之一
-TTS_VOICE_EN = "af_heart"    # Kokoro 官方内置的英语女声之一
-# 注意: 如果 af_heart 这个语音名跟你本地 speaches 提供的语音列表对不上，
-# 用 `curl http://localhost:8000/v1/audio/voices` 查一下实际可用的名字改这里。
+# STT 型号：paraformer-realtime-v2 是 livekit-plugins-aliyun 的默认值，但官方
+# 已经建议迁移到新一代模型。fun-asr-realtime 官方文档里明确写了支持中英文动态
+# 切换识别，作为电话场景的首选；qwen3-asr-flash-realtime 是另一个新模型，值得
+# 也测一遍对比准确率/延迟，自己实测后二选一。
+STT_MODEL = "fun-asr-realtime"
 
-# 本地 Ollama (LLM, OpenAI 兼容 API, 跑 Qwen)
-# qwen3:8b 比之前的 qwen2.5:7b 新一代，中文表达能力更好，体积相近 (Q4 约 5.2GB)，
-# 32GB 内存的机器跑起来跟 2.5 代差不多吃得消。
-OLLAMA_URL = "http://localhost:11434/v1"
-OLLAMA_MODEL = "qwen3:8b"
+# STT 的 language 参数是"语言提示"(language_hints)，不是硬性限制——传中文提示时
+# 遇到夹杂的英文单词大概率也能识别，但如果整通电话基本讲英文，建议把这里改成 "en"
+# 单独测一遍效果。livekit-plugins-aliyun 的 STT 在流式模式下必须显式传 language，
+# 不支持自动检测。
+STT_LANGUAGE = "zh"
+
+# LLM 型号：qwen-plus 性价比均衡。预算紧张换 qwen-turbo，要更强推理换 qwen-max。
+# (qwen-plus/turbo/max 不是"思考模型"，不会像本地 qwen3:8b 那样默认输出大段
+# <think>...</think>，所以这里不需要之前 Ollama 版本里那个 reasoning_effort hack。)
+LLM_MODEL = "qwen-plus"
+
+# TTS 型号 + 音色：cosyvoice-v3-flash 主打低延迟流式。CosyVoice v3 的很多"中文"
+# 音色其实是中英双语的 (比如默认音色 longanyang)，但英文发音总归不如专门的英文
+# 音色地道，所以还是保留原来 Kokoro 版本那套"按实际要念的文本是中文还是英文,
+# 动态切换音色"的思路，只是把两个音色都换成 DashScope 这边的:
+#   - longxiaochun_v3: 女声,中文为主(带基本英文能力)
+#   - loongannie_v3: 女声,美式英语
+# 完整音色列表: https://help.aliyun.com/zh/model-studio/cosyvoice-voice-list
+TTS_MODEL = "cosyvoice-v3-flash"
+TTS_VOICE_ZH = "longxiaochun_v3"
+TTS_VOICE_EN = "loongannie_v3"
 
 # 判断一段文本是中文还是英文：只要出现汉字就当中文处理 (常见中英文混说场景里，
-# 中文语音+misaki 音素化对夹杂的英文单词容错度还可以；纯英文才需要切到英文语音，
-# 否则中文语音读英文会非常不准)。
+# 中文音色对夹杂的英文单词容错度还可以；纯英文才需要切到英文音色，否则中文音色
+# 读纯英文会不够地道)。
 _CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
 
 
@@ -44,14 +59,8 @@ def _is_chinese(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
 
 
-def _make_tts(voice: str) -> openai.TTS:
-    return openai.TTS(
-        base_url=SPEACHES_URL,
-        model=TTS_MODEL,
-        voice=voice,
-        api_key="not-needed",
-        response_format="wav",
-    )
+def _make_tts(voice: str) -> aliyun.TTS:
+    return aliyun.TTS(model=TTS_MODEL, voice=voice)
 
 
 class Assistant(Agent):
@@ -70,15 +79,10 @@ class Assistant(Agent):
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings
     ) -> AsyncIterable[rtc.AudioFrame]:
-        # 之前的版本是根据"用户刚才说的是中文还是英文"提前切语音，但 LLM 不一定
-        # 每次都严格遵守"跟着对方语言回复"的提示——真实测试里出现过用户说英文、
-        # LLM 却用中文回复的情况，这时候如果 TTS 已经提前切到了英文语音，就会变成
-        # "用英文语音去读中文文本"，Kokoro 会把这段中文交给 espeak 走英文的音素化
-        # 路径处理，结果不是发音诡异，就是卡很久甚至像坏掉了一样(用户反馈"疯了")。
-        # 所以改成在这里 (真正要合成语音的这一步) 直接看"实际要念出来的文本"本身
-        # 是中文还是英文，而不是去猜用户上一句话的语言，这样语音和文本内容永远是
-        # 匹配的。代价是要先把这一轮的文本流缓冲完才能判断语言，会晚一点点开始出声
-        # (通常也就一两句话，问题不大)。
+        # 和之前 Kokoro 版本同样的原因：LLM 不一定每次都严格遵守"跟着对方语言
+        # 回复"的提示，所以不去猜用户上一句话的语言，而是在真正要合成语音这一步，
+        # 直接看"实际要念出来的文本"本身是中文还是英文，保证语音和文本内容永远
+        # 匹配。代价是要先把这一轮文本流缓冲完才能判断语言，会晚一点点开始出声。
         chunks: list[str] = []
         async for chunk in text:
             chunks.append(chunk)
@@ -98,23 +102,12 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
     session = AgentSession(
-        stt=openai.STT(
-            base_url=FUNASR_URL,
+        stt=aliyun.STT(
             model=STT_MODEL,
-            api_key="not-needed",
+            language=STT_LANGUAGE,
         ),
-        llm=openai.LLM.with_ollama(
-            model=OLLAMA_MODEL,
-            base_url=OLLAMA_URL,
-            # qwen3 系列默认会先输出一大段 <think>...</think> 内心独白再正式回答，
-            # 电话语音场景绝对不能要这个 (会被 TTS 整段读出来，还很慢)。
-            # reasoning_effort="none" 会被 livekit-plugins-openai 转成请求里的
-            # reasoning_effort 字段，Ollama 的 OpenAI 兼容接口认这个字段，
-            # 收到后会在其内置的 qwen3 模板里插入一个空的 <think></think>，
-            # 从结构上就不给模型输出思考内容的机会 (不是"建议它别想"，是根本没机会想)。
-            reasoning_effort="none",
-        ),
-        tts=_make_tts(TTS_VOICE_ZH),  # 默认中文语音，开场白用这个
+        llm=aliyun.LLM(model=LLM_MODEL),
+        tts=_make_tts(TTS_VOICE_ZH),  # 默认中文音色，开场白用这个
         vad=silero.VAD.load(),
     )
 

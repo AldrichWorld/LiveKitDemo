@@ -55,3 +55,58 @@ docker run --rm -p 7880:7880 -p 7881:7881 -p 7882:7882/udp \
 ```
 
 其余（演示前端、连接信息）用法一致。
+
+## 语音 Agent：已迁移到阿里云百炼 (DashScope)
+
+`sip-ai/agent/agent.py` 现在 LLM/STT/TTS 三个组件全部换成了阿里云百炼(DashScope)
+的云端 API（型号：LLM `qwen-plus`，STT `fun-asr-realtime`，TTS `cosyvoice-v3-flash`），
+不再依赖本地 Ollama / FunASR / Speaches。三个组件共用同一个 `DASHSCOPE_API_KEY`。
+
+### 1. 配置 API Key
+
+`sip-ai/agent/.env.local` 已经加了 `DASHSCOPE_API_KEY`（这个文件不会被 git 跟踪，
+放心改）。如果要换成你自己另外的 Key，直接编辑这个文件即可：
+
+```
+DASHSCOPE_API_KEY=你的key
+```
+
+### 2. 安装依赖（需要你自己在 Terminal 里跑）
+
+我（Claude）能读写这台 Mac 上的项目文件，但不能在你的真实终端里执行命令、装软件——
+这一步需要你自己跑：
+
+```bash
+cd ~/Projects/livekit-test/sip-ai/agent
+source .venv/bin/activate   # 如果 .venv 不存在，先 python3 -m venv .venv
+pip install -r requirements.txt
+```
+
+**如果 `pip install` 在 `osc-data` 这个包上报错（提示要下载/编译 Rust 工具链）**：
+`livekit-plugins-aliyun` 的 TTS 部分依赖一个叫 `osc-data` 的包，它需要 Rust 才能
+从源码构建。先装 Rust 再重新跑一遍 pip install：
+
+```bash
+curl https://sh.rustup.rs -sSf | sh   # 或者 brew install rustup-init && rustup-init
+source "$HOME/.cargo/env"
+pip install -r requirements.txt
+```
+
+### 3. 启动
+
+和之前一样：
+
+```bash
+python agent.py dev
+```
+
+### 4. 需要你自己实测确认的点
+
+- `fun-asr-realtime` 的 `language="zh"` 参数是"语言提示"，不是强制限制——真实
+  打电话时中英文混说的识别效果如何，需要你实际测一遍。如果发现效果不理想，可以
+  在 `agent.py` 顶部把 `STT_MODEL` 换成 `qwen3-asr-flash-realtime` 对比一下。
+- `longxiaochun_v3` / `loongannie_v3` 这两个音色是随手选的，完整音色表在
+  <https://help.aliyun.com/zh/model-studio/cosyvoice-voice-list>，听着不满意可以
+  在 `agent.py` 顶部的 `TTS_VOICE_ZH` / `TTS_VOICE_EN` 换别的。
+- 声音克隆（用你自己的声音）这一版没有做——你确认过不需要，用的是官方预置音色。
+  以后想要的话，需要额外跑一次 DashScope 的 voice-enrollment 接口。
